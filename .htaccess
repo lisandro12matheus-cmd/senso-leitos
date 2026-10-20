@@ -1,0 +1,5 @@
+RewriteEngine On
+RewriteBase /leito-vivo/
+RewriteRule ^$ /leito-vivo/dist/ [R=302,L]
+
+
