@@ -1,18 +1,22 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import {
   Activity, ArrowDownLeft, ArrowRight, BedDouble, Building2, Check, ChevronDown,
-  CircleHelp, ClipboardList, Download, FileSpreadsheet, LayoutDashboard, Menu, Plus,
+  CircleHelp, ClipboardList, Clock3, Download, FileSpreadsheet, LayoutDashboard, Menu, Plus,
   Search, ShieldCheck, Siren, Users, Wrench, X,
 } from 'lucide-react';
-import { BED_STATUS, BED_TYPE, type AppState, type Bed, type BedStatus, type BedType } from '../domain/types';
+import { BED_STATUS, BED_TYPE, type AppState, type Bed, type BedStatus, type BedType, type Origin } from '../domain/types';
 import { countByStatus, patientForAdmission } from '../domain/logic';
 import { selectActiveAdmissions, selectBeds, selectCounts, selectMovements } from '../domain/selectors';
 import { downloadCsv } from '../domain/csv';
-import { useLeitoStore } from '../store/useLeitoStore';
+import { createId, useLeitoStore } from '../store/useLeitoStore';
 
-type Page = 'painel' | 'leitos' | 'entrada' | 'saida' | 'pacientes' | 'manutencao' | 'movimentacoes' | 'relatorios' | 'samu';
+type Page = 'painel' | 'leitos' | 'entrada' | 'fila' | 'saida' | 'pacientes' | 'manutencao' | 'movimentacoes' | 'relatorios' | 'samu';
+type WaitlistItem = {
+  id: string; patientId: string | null; patientName: string; birthDate: string; contact: string;
+  hospitalId: string; type: BedType; origin: Origin; reason: string; procedureCode: string; createdAt: string;
+};
 type Modal =
-  | { kind: 'entry'; bedId?: string }
+  | { kind: 'entry'; bedId?: string; queueId?: string }
   | { kind: 'exit'; admissionId: string }
   | { kind: 'maintenance'; bedId?: string }
   | { kind: 'finish-maintenance'; bedId: string }
@@ -25,6 +29,7 @@ const NAV: { id: Page; label: string; icon: ReactNode }[] = [
   { id: 'painel', label: 'Painel geral', icon: <LayoutDashboard size={18} /> },
   { id: 'leitos', label: 'Mapa de leitos', icon: <BedDouble size={18} /> },
   { id: 'entrada', label: 'Entrada de paciente', icon: <ArrowDownLeft size={18} /> },
+  { id: 'fila', label: 'Fila de espera', icon: <Clock3 size={18} /> },
   { id: 'saida', label: 'Saída de paciente', icon: <ArrowRight size={18} /> },
   { id: 'pacientes', label: 'Pacientes', icon: <Users size={18} /> },
   { id: 'manutencao', label: 'Higienização e manutenção', icon: <Wrench size={18} /> },
@@ -33,7 +38,7 @@ const NAV: { id: Page; label: string; icon: ReactNode }[] = [
 ];
 
 const PAGE_TITLE: Record<Page, string> = {
-  painel: 'Painel de leitos', leitos: 'Mapa de leitos', entrada: 'Registrar entrada',
+  painel: 'Painel de leitos', leitos: 'Mapa de leitos', entrada: 'Registrar entrada', fila: 'Fila de espera',
   saida: 'Registrar saída', pacientes: 'Pacientes', manutencao: 'Higienização e manutenção',
   movimentacoes: 'Movimentações recentes', relatorios: 'Planilha de leitos', samu: 'Consulta SAMU',
 };
@@ -56,6 +61,13 @@ const localDateTimeValue = (offsetMinutes: number) => {
 };
 const normalize = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 const statusText = (status: BedStatus) => BED_STATUS[status].label;
+const WAITLIST_KEY = 'senso-de-leitos:fila:v1';
+function loadWaitlist(): WaitlistItem[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(WAITLIST_KEY) || '[]');
+    return Array.isArray(value) ? value as WaitlistItem[] : [];
+  } catch { return []; }
+}
 
 export function App() {
   const [, setClockTick] = useState(0);
@@ -83,6 +95,10 @@ export function App() {
   const [modal, setModal] = useState<Modal | null>(null);
   const [toast, setToast] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
+  const [waitlist, setWaitlist] = useState<WaitlistItem[]>(loadWaitlist);
+  useEffect(() => {
+    try { localStorage.setItem(WAITLIST_KEY, JSON.stringify(waitlist)); } catch { /* Demo storage is best effort. */ }
+  }, [waitlist]);
 
   const filteredBeds = useMemo(() => selectBeds(app, {
     hospitalId: hospitalId === 'all' ? undefined : hospitalId,
@@ -95,7 +111,6 @@ export function App() {
   const admissions = selectActiveAdmissions(app, query, hospitalId === 'all' ? undefined : hospitalId);
   const patientList = app.patients.filter((p) => !query || normalize([p.displayName, p.socialName || '', p.localRecord].join(' ')).includes(normalize(query)));
   const movements = selectMovements(app, { hospitalId: hospitalId === 'all' ? undefined : hospitalId, query }).slice(0, 70);
-  const bedMap = new Map(app.beds.map((b) => [b.id, b]));
 
   function notify(message: string) {
     setToast(message);
@@ -116,6 +131,7 @@ export function App() {
     const response = await result;
     if (response.ok) setModal(null);
     notify(response.message);
+    return response;
   }
   async function submitModal(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -123,32 +139,44 @@ export function App() {
     const data = new FormData(event.currentTarget);
     const get = (key: string) => String(data.get(key) ?? '').trim();
     if (modal.kind === 'entry') {
+      const submitter = (event.nativeEvent as SubmitEvent).submitter;
+      const intent = submitter instanceof HTMLButtonElement ? submitter.value : '';
       const patientId = get('patientId');
-      const patientName = get('patientName');
-      await act(admit({
+      const savedPatient = app.patients.find((item) => item.id === patientId);
+      const patientName = get('patientName') || savedPatient?.displayName || '';
+      if (intent === 'queue') {
+        const item: WaitlistItem = {
+          id: createId('FILA'), patientId: patientId || null, patientName,
+          birthDate: get('birthDate'), contact: get('contact'), hospitalId: get('hospitalId'),
+          type: get('bedType') as BedType, origin: get('origin') as Origin, reason: get('reason'),
+          procedureCode: get('procedureCode'), createdAt: new Date().toISOString(),
+        };
+        setWaitlist((current) => [...current, item]);
+        setModal(null);
+        notify('Paciente incluído na fila de espera.');
+        return;
+      }
+      const response = await act(admit({
         patientId: patientId || undefined,
         patient: patientId ? undefined : {
           displayName: patientName,
-          socialName: get('socialName') || null,
+          socialName: null,
           birthDate: get('birthDate') || null,
           unidentified: false,
           documentType: null,
           documentValue: null,
-          address: {
-            street: get('street'), number: get('number'), district: get('district'),
-            city: get('city') || 'Belém', state: get('state') || 'PA',
-          },
+          address: null,
           contact: get('contact') || null,
-          guardian: get('guardian') || null,
+          guardian: null,
         },
         hospitalId: get('hospitalId'),
         bedId: get('bedId'),
-        type: (bedMap.get(get('bedId'))?.type || 'clinical') as BedType,
-        origin: get('origin') as 'samu' | 'spontaneous' | 'transfer' | 'other',
+        type: get('bedType') as BedType,
+        origin: get('origin') as Origin,
         reason: get('reason'),
         procedureCode: get('procedureCode') || undefined,
-        procedureDescription: get('procedureDescription') || undefined,
       }));
+      if (response.ok && modal.queueId) setWaitlist((current) => current.filter((item) => item.id !== modal.queueId));
     } else if (modal.kind === 'exit') {
       await act(discharge({
         admissionId: modal.admissionId,
@@ -182,7 +210,7 @@ export function App() {
       <div className="brand"><div className="brand-icon"><BedDouble size={21} /></div><div className="brand-name">SENSO DE <span>LEITOS</span><small>GESTÃO HOSPITALAR</small></div></div>
       <div className="side-caption">OPERAÇÃO HOSPITALAR</div>
       <nav className="side-nav" aria-label="Navegação principal">
-        {NAV.map((item) => <button key={item.id} className={'nav-item' + (page === item.id ? ' selected' : '')} onClick={() => go(item.id)}>{item.icon}<span>{item.label}</span>{item.id === 'manutencao' && <em>{app.maintenances.filter((m) => m.status === 'open').length}</em>}</button>)}
+        {NAV.map((item) => <button key={item.id} className={'nav-item' + (page === item.id ? ' selected' : '')} onClick={() => go(item.id)}>{item.icon}<span>{item.label}</span>{item.id === 'manutencao' && <em>{app.maintenances.filter((m) => m.status === 'open').length}</em>}{item.id === 'fila' && waitlist.length > 0 && <em>{waitlist.length}</em>}</button>)}
       </nav>
       <div className="side-spacer" />
       <button className={'nav-item samu-link' + (page === 'samu' ? ' selected' : '')} onClick={() => go('samu')}><Siren size={18} /><span>Consulta SAMU<small>Visão sem dados pessoais</small></span><ArrowRight size={15} /></button>
@@ -197,7 +225,7 @@ export function App() {
         <div className="top-actions"><span className="saved"><i /> Salvo neste navegador</span><button className="btn btn-primary" onClick={() => setModal({ kind: 'entry' })}><Plus size={17} /> Nova entrada</button><button className="btn btn-light" onClick={() => go('saida')}>Registrar saída</button></div>
       </header>
       <section className="content">
-        <div className="heading-row"><div><div className="eyebrow">REDE DE HOSPITAIS <span className="eyebrow-dot" /> DEMONSTRAÇÃO</div><h1>{PAGE_TITLE[page]}</h1><p className="subheading">{page === 'samu' ? 'Consulta rápida de disponibilidade por hospital e tipo de leito.' : 'Acompanhe a disponibilidade e registre as movimentações do dia.'}</p></div>
+        <div className="heading-row"><div><div className="eyebrow">REDE DE HOSPITAIS <span className="eyebrow-dot" /> DEMONSTRAÇÃO</div><h1>{PAGE_TITLE[page]}</h1><p className="subheading">{page === 'samu' ? 'Consulta rápida de disponibilidade por hospital e tipo de leito.' : page === 'fila' ? 'Acompanhe a espera por categoria e conclua a entrada quando surgir uma vaga.' : 'Acompanhe a disponibilidade e registre as movimentações do dia.'}</p></div>
           {page !== 'samu' && <div className="header-stamp"><span className="stamp-dot" /> Atualizado {fmt(app.updatedAt, { hour: '2-digit', minute: '2-digit' })}<small>Horário local de Belém</small></div>}
         </div>
         {storageError && <div className="notice notice-warning"><strong>Não foi possível ler uma versão salva.</strong> A demonstração está usando os dados iniciais. {storageError}</div>}
@@ -205,6 +233,7 @@ export function App() {
         {page === 'painel' && <Dashboard app={app} hospitalId={hospitalId} counts={bedCounts} totals={totals} onConfirm={async (id) => notify((await confirmMap(id)).message)} onOpen={(status) => { setStatusFilter(status); go('leitos'); setStatusFilter(status); }} onNavigate={go} />}
         {page === 'leitos' && <BedsView app={app} beds={filteredBeds} query={query} setQuery={setQuery} statusFilter={statusFilter} setStatusFilter={setStatusFilter} typeFilter={typeFilter} setTypeFilter={setTypeFilter} onAction={(next) => setModal(next)} hospitalId={hospitalId} />}
         {page === 'entrada' && <EntryIntro onStart={() => setModal({ kind: 'entry' })} app={app} hospitalId={hospitalId} />}
+        {page === 'fila' && <WaitlistView app={app} items={waitlist} onRegister={(item, bedId) => setModal({ kind: 'entry', queueId: item.id, bedId })} onRemove={(id) => setWaitlist((current) => current.filter((item) => item.id !== id))} />}
         {page === 'saida' && <ExitView app={app} admissions={admissions} query={query} setQuery={setQuery} onSelect={(id) => setModal({ kind: 'exit', admissionId: id })} />}
         {page === 'pacientes' && <PatientsView patients={patientList} app={app} query={query} setQuery={setQuery} />}
         {page === 'manutencao' && <MaintenanceView app={app} hospitalId={hospitalId} onAction={(next) => setModal(next)} />}
@@ -214,7 +243,7 @@ export function App() {
       </section>
       <footer className="page-footer"><span>SENSO DE LEITOS <b>·</b> Protótipo estático para apresentação</span><span>As alterações ficam salvas apenas neste navegador</span></footer>
     </main>
-    {modal && <ModalView modal={modal} app={app} onClose={() => setModal(null)} onSubmit={submitModal} />}
+    {modal && <ModalView modal={modal} app={app} queueItem={modal.kind === 'entry' && modal.queueId ? waitlist.find((item) => item.id === modal.queueId) : undefined} onClose={() => setModal(null)} onSubmit={submitModal} />}
     {toast && <div role="status" className="toast"><Check size={17} />{toast}<button onClick={() => setToast('')} aria-label="Fechar"><X size={15} /></button></div>}
   </div>;
 }
@@ -406,7 +435,9 @@ function SamuView({ app, onConfirm }: { app: AppState; onConfirm: (id: string) =
   })}</div><BedStatusLegend /><p className="samu-caveat"><CircleHelp size={16} /> Este painel demonstra o fluxo. A capacidade e os status são fictícios, salvos localmente e não representam disponibilidade assistencial real.</p></>;
 }
 
-function ModalView({ modal, app, onClose, onSubmit }: { modal: Modal; app: AppState; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+function ModalView({ modal, app, queueItem, onClose, onSubmit }: { modal: Modal; app: AppState; queueItem?: WaitlistItem; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  const [entryStep, setEntryStep] = useState(1);
+  const [matchingBeds, setMatchingBeds] = useState(0);
   const selectedBed = 'bedId' in modal && modal.bedId ? app.beds.find((b) => b.id === modal.bedId) : undefined;
   const available = app.beds.filter((b) => b.status === 'available');
   const unusedPatients = app.patients.filter((p) => !app.admissions.some((a) => a.patientId === p.id && a.status === 'active'));
@@ -419,7 +450,7 @@ function ModalView({ modal, app, onClose, onSubmit }: { modal: Modal; app: AppSt
     'cancel-reservation': 'Cancelar reserva', unblock: 'Retirar bloqueio',
   };
   const descriptions: Record<Modal['kind'], string> = {
-    entry: 'Preencha os dados básicos para vincular o paciente a um leito.',
+    entry: queueItem ? 'Conclua os dados da internação quando houver uma vaga compatível.' : 'Informe os dados do paciente e, em seguida, os dados da internação.',
     exit: 'Informe o tipo de saída. O leito seguirá para higienização.',
     maintenance: 'O leito ficará indisponível até a manutenção ser concluída.',
     'finish-maintenance': 'Ao concluir, o leito passará para higienização.',
@@ -432,7 +463,10 @@ function ModalView({ modal, app, onClose, onSubmit }: { modal: Modal; app: AppSt
     <header className="dialog-head"><div><h2 id="dialog-title">{titles[modal.kind]}</h2><p>{descriptions[modal.kind]}</p></div><button className="icon-plain" onClick={onClose} aria-label="Fechar"><X size={19} /></button></header>
     {bed && <div className="dialog-bed"><BedDouble size={16} /><strong>{bed.code}</strong><span>{hospitalName(app, bed.hospitalId)} · {BED_TYPE[bed.type]}</span><span className={'status-pill ' + bed.status}>{statusText(bed.status)}</span></div>}
     <form onSubmit={onSubmit} className="dialog-form">
-      {modal.kind === 'entry' && <EntryFields app={app} selectedBed={selectedBed} available={available} patients={unusedPatients} />}
+      {modal.kind === 'entry' && <>
+        <div className="entry-progress" aria-label={`Etapa ${entryStep} de 2`}><span className={entryStep === 1 ? 'current' : 'done'}><i>1</i><b>Paciente</b></span><i className={entryStep === 2 ? 'done' : ''} /><span className={entryStep === 2 ? 'current' : ''}><i>2</i><b>Internação</b></span></div>
+        <EntryFields app={app} selectedBed={selectedBed} available={available} patients={unusedPatients} queueItem={queueItem} step={entryStep} onAvailableChange={setMatchingBeds} />
+      </>}
       {modal.kind === 'exit' && <><div className="person-highlight"><span className="patient-avatar">{patient?.displayName.slice(0, 1) || '?'}</span><span><strong>{patient?.displayName || 'Paciente'}</strong><small>{patient?.localRecord} · {hospitalName(app, admission?.hospitalId || '')} · {bed?.code}</small></span></div>
         <Field label="Tipo de saída" required><select name="dischargeType" defaultValue="discharge" required><option value="discharge">Alta</option><option value="external_transfer">Transferência externa</option><option value="evasion">Evasão</option><option value="death">Óbito</option><option value="other">Outro</option></select></Field>
         <Field label="Destino (se transferência)"><input name="destination" placeholder="Hospital ou unidade de destino" /></Field><Field label="Observação"><textarea name="note" rows={2} placeholder="Complemento do registro, se necessário" /></Field></>}
@@ -442,25 +476,59 @@ function ModalView({ modal, app, onClose, onSubmit }: { modal: Modal; app: AppSt
       {modal.kind === 'reserve' && <><Field label="Responsável pela reserva" required><input name="responsible" required placeholder="Nome da pessoa responsável" /></Field><Field label="Previsão de chegada" required><input name="expectedAt" required type="datetime-local" defaultValue={localDateTimeValue(60)} /></Field><Field label="Protocolo (opcional)"><input name="protocol" placeholder="Número de referência" /></Field></>}
       {modal.kind === 'cancel-reservation' && <Field label="Motivo do cancelamento" required><input name="reason" required placeholder="Informe o motivo" /></Field>}
       {modal.kind === 'unblock' && <Field label="Motivo da retirada do bloqueio" required><input name="reason" required placeholder="Informe a conferência realizada" /></Field>}
-      <div className="dialog-actions"><button type="button" className="btn btn-light" onClick={onClose}>Cancelar</button><button type="submit" className="btn btn-primary">{modal.kind === 'entry' ? 'Registrar entrada' : modal.kind === 'exit' ? 'Confirmar saída' : modal.kind === 'maintenance' ? 'Iniciar manutenção' : modal.kind === 'reserve' ? 'Confirmar reserva' : 'Confirmar'}</button></div>
+      <div className="dialog-actions"><button type="button" className="btn btn-light" onClick={modal.kind === 'entry' && entryStep === 2 ? () => setEntryStep(1) : onClose}>{modal.kind === 'entry' && entryStep === 2 ? 'Voltar' : 'Cancelar'}</button>
+        {modal.kind === 'entry' && entryStep === 1 ? <button type="button" className="btn btn-primary" onClick={(event) => {
+          const form = event.currentTarget.form;
+          const patientId = String(new FormData(form!).get('patientId') || '');
+          const name = form?.elements.namedItem('patientName') as HTMLInputElement | null;
+          if (!patientId && name && !name.checkValidity()) { name.reportValidity(); return; }
+          setEntryStep(2);
+        }}>Próximo <ArrowRight size={15} /></button>
+          : modal.kind === 'entry' && matchingBeds === 0 ? <button type="submit" name="intent" value="queue" className="btn btn-primary">Adicionar à fila</button>
+            : <button type="submit" className="btn btn-primary">{modal.kind === 'entry' ? 'Registrar entrada' : modal.kind === 'exit' ? 'Confirmar saída' : modal.kind === 'maintenance' ? 'Iniciar manutenção' : modal.kind === 'reserve' ? 'Confirmar reserva' : 'Confirmar'}</button>}
+      </div>
     </form>
   </section></div>;
 }
 
-function EntryFields({ app, selectedBed, available, patients }: { app: AppState; selectedBed?: Bed; available: Bed[]; patients: AppState['patients'] }) {
-  const initialHospital = selectedBed?.hospitalId || app.hospitals[0]?.id || '';
-  const [selectedPatient, setSelectedPatient] = useState('');
-  return <><div className="form-grid"><Field label="Hospital" required><select name="hospitalId" required defaultValue={initialHospital}>{app.hospitals.map((h) => <option key={h.id} value={h.id}>{h.name}</option>)}</select></Field>
-    <Field label="Leito disponível" required><select name="bedId" required defaultValue={selectedBed?.id || ''}><option value="" disabled>Selecione um leito</option>{available.map((b) => <option key={b.id} value={b.id}>{b.code} · {hospitalName(app, b.hospitalId)} · {BED_TYPE[b.type]}</option>)}</select></Field></div>
-    <Field label="Paciente já cadastrado?"><select name="patientId" value={selectedPatient} onChange={(e) => setSelectedPatient(e.target.value)}><option value="">Novo cadastro de demonstração</option>{patients.slice(0, 100).map((p) => <option key={p.id} value={p.id}>{p.displayName} · {p.localRecord}</option>)}</select></Field>
-    <div className="form-grid"><Field label="Nome completo (para novo cadastro)" required={!selectedPatient}><input name="patientName" placeholder="Nome do paciente" required={!selectedPatient} /></Field><Field label="Nome social"><input name="socialName" placeholder="Opcional" /></Field></div>
-    <div className="form-grid"><Field label="Nascimento"><input name="birthDate" type="date" /></Field><Field label="Telefone de contato"><input name="contact" placeholder="(91) 00000-0000" /></Field></div>
-    <div className="form-grid"><Field label="Endereço"><input name="street" placeholder="Rua ou avenida" /></Field><Field label="Número"><input name="number" placeholder="Nº" /></Field></div>
-    <div className="form-grid"><Field label="Bairro"><input name="district" placeholder="Bairro" /></Field><Field label="Responsável"><input name="guardian" placeholder="Se necessário" /></Field></div>
-    <div className="form-grid"><Field label="Origem" required><select name="origin" defaultValue="samu"><option value="samu">SAMU</option><option value="spontaneous">Demanda espontânea</option><option value="transfer">Transferência</option><option value="other">Outra origem</option></select></Field><Field label="Código do procedimento"><input name="procedureCode" placeholder="Ex.: DEMO-PROC-001" /></Field></div>
-    <Field label="Motivo da internação" required><textarea name="reason" required rows={2} placeholder="Descreva brevemente o motivo da entrada" /></Field>
-    <p className="form-hint"><ShieldCheck size={15} /> Tipo de leito preenchido conforme leito selecionado. O cadastro é fictício e local.</p>
+function EntryFields({ app, selectedBed, available, patients, queueItem, step, onAvailableChange }: {
+  app: AppState; selectedBed?: Bed; available: Bed[]; patients: AppState['patients']; queueItem?: WaitlistItem;
+  step: number; onAvailableChange: (count: number) => void;
+}) {
+  const [selectedPatient, setSelectedPatient] = useState(queueItem?.patientId || '');
+  const [hospitalId, setHospitalId] = useState(selectedBed?.hospitalId || queueItem?.hospitalId || app.hospitals[0]?.id || '');
+  const [bedType, setBedType] = useState<BedType>(selectedBed?.type || queueItem?.type || 'clinical');
+  const [bedId, setBedId] = useState(selectedBed?.id || '');
+  const bedsForSelection = available.filter((bed) => bed.hospitalId === hospitalId && bed.type === bedType);
+  useEffect(() => { onAvailableChange(bedsForSelection.length); }, [bedsForSelection.length, onAvailableChange]);
+  return <>
+    <section className="entry-step" hidden={step !== 1} aria-label="Dados do paciente">
+      <div className="step-copy"><h3>Dados do paciente</h3><p>Selecione um cadastro existente ou comece um novo.</p></div>
+      <Field label="Paciente já cadastrado?"><select name="patientId" value={selectedPatient} onChange={(event) => setSelectedPatient(event.target.value)}><option value="">Novo cadastro</option>{patients.slice(0, 100).map((patient) => <option key={patient.id} value={patient.id}>{patient.displayName} · {patient.localRecord}</option>)}</select></Field>
+      <div hidden={Boolean(selectedPatient)}>
+        <Field label="Nome completo" required={!selectedPatient}><input name="patientName" defaultValue={queueItem?.patientName || ''} placeholder="Nome do paciente" required={step === 1 && !selectedPatient} /></Field>
+        <div className="form-grid"><Field label="Data de nascimento"><input name="birthDate" type="date" defaultValue={queueItem?.birthDate || ''} /></Field><Field label="Telefone para contato"><input name="contact" placeholder="Opcional" defaultValue={queueItem?.contact || ''} /></Field></div>
+      </div>
+    </section>
+    <section className="entry-step" hidden={step !== 2} aria-label="Informações da internação">
+      <div className="step-copy"><h3>Informações da internação</h3><p>Escolha onde o paciente será atendido.</p></div>
+      <Field label="Hospital" required><select name="hospitalId" value={hospitalId} onChange={(event) => { setHospitalId(event.target.value); setBedId(''); }} required>{app.hospitals.map((hospital) => <option key={hospital.id} value={hospital.id}>{hospital.name}</option>)}</select></Field>
+      <div className="form-grid"><Field label="Tipo de leito" required><select name="bedType" value={bedType} onChange={(event) => { setBedType(event.target.value as BedType); setBedId(''); }}>{Object.entries(BED_TYPE).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></Field>
+        {bedsForSelection.length > 0 ? <Field label="Leito disponível" required><select name="bedId" value={bedId} onChange={(event) => setBedId(event.target.value)} required><option value="" disabled>Selecione um leito</option>{bedsForSelection.map((bed) => <option key={bed.id} value={bed.id}>{bed.code} · {app.blocks.find((block) => block.id === bed.blockId)?.name || 'Bloco'}</option>)}</select></Field> : <div className="no-bed-notice"><Clock3 size={18} /><span><strong>Sem vaga de {BED_TYPE[bedType].toLowerCase()}</strong><small>Adicione à fila para acompanhar a disponibilidade.</small></span></div>}</div>
+      <div className="form-grid"><Field label="Origem" required><select name="origin" defaultValue={queueItem?.origin || 'samu'}><option value="samu">SAMU</option><option value="spontaneous">Demanda espontânea</option><option value="transfer">Transferência</option><option value="other">Outra origem</option></select></Field><Field label="Código do procedimento"><input name="procedureCode" defaultValue={queueItem?.procedureCode || ''} placeholder="Opcional" /></Field></div>
+      <Field label="Motivo da internação" required><textarea name="reason" required rows={2} defaultValue={queueItem?.reason || ''} placeholder="Descreva brevemente o motivo" /></Field>
+    </section>
   </>;
+}
+
+function WaitlistView({ app, items, onRegister, onRemove }: { app: AppState; items: WaitlistItem[]; onRegister: (item: WaitlistItem, bedId: string) => void; onRemove: (id: string) => void }) {
+  const orderedItems = [...items].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+  return <section className="panel waitlist-panel"><div className="panel-heading"><div><h2>Pacientes aguardando por leito</h2><p>Vagas compatíveis aparecem aqui para concluir a entrada.</p></div><span className="count-badge">{items.length} {items.length === 1 ? 'paciente' : 'pacientes'}</span></div>
+    {orderedItems.length ? <div className="waitlist-items">{orderedItems.map((item, index) => {
+      const freeBed = app.beds.find((bed) => bed.status === 'available' && bed.hospitalId === item.hospitalId && bed.type === item.type);
+      return <article className="waitlist-item" key={item.id}><span className="waitlist-number">{index + 1}</span><div className="waitlist-person"><strong>{item.patientName || app.patients.find((patient) => patient.id === item.patientId)?.displayName || 'Paciente'}</strong><span>{hospitalName(app, item.hospitalId)} · {BED_TYPE[item.type]}</span><small>{item.reason} · aguardando desde {fmt(item.createdAt, { hour: '2-digit', minute: '2-digit' })}</small></div><div className="waitlist-status"><span className={'status-pill ' + (freeBed ? 'available' : 'reserved')}>{freeBed ? `Vaga ${freeBed.code} disponível` : 'Aguardando vaga'}</span><div><button type="button" className="btn btn-primary btn-small" disabled={!freeBed} onClick={() => freeBed && onRegister(item, freeBed.id)}>Registrar entrada</button><button type="button" className="waitlist-remove" onClick={() => onRemove(item.id)}>Remover</button></div></div></article>;
+    })}</div> : <Empty text="Ainda não há pacientes aguardando. Se não houver uma vaga do tipo solicitado, inclua o paciente na fila durante o cadastro." />}
+  </section>;
 }
 
 function Field({ label, required, children }: { label: string; required?: boolean; children: ReactNode }) { return <label className="field"><span>{label}{required && <b> *</b>}</span>{children}</label>; }
@@ -485,5 +553,4 @@ function movementLabel(type: string) {
   };
   return names[type] || 'Situação atualizada';
 }
-
 
